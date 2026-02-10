@@ -102,7 +102,7 @@ STEP_MEDIA_DEFS = {
 # Google Sheets CONFIG
 # =========================
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "google_creds.json").strip()
+GOOGLE_CREDS_JSON_TEXT = os.getenv("GOOGLE_CREDS_JSON_TEXT", "").strip()
 BOT_VERSION = os.getenv("BOT_VERSION", "1.0.0").strip()
 
 CASOS_COLUMNS = [
@@ -749,10 +749,21 @@ def outbox_mark_failed(outbox_id: int, attempts: int, err: str, dead: bool = Fal
 def sheets_client():
     if not SHEET_ID:
         raise RuntimeError("Falta SHEET_ID. Configura la variable SHEET_ID.")
-    if not GOOGLE_CREDS_JSON:
-        raise RuntimeError("Falta GOOGLE_CREDS_JSON. Configura la variable GOOGLE_CREDS_JSON.")
+
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file(GOOGLE_CREDS_JSON, scopes=scopes)
+
+    # Prioridad 1: JSON en texto (Railway)
+    if GOOGLE_CREDS_JSON_TEXT:
+        import json
+        creds_info = json.loads(GOOGLE_CREDS_JSON_TEXT)
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+
+    # Prioridad 2: archivo local (PC)
+    else:
+        if not GOOGLE_CREDS_JSON:
+            raise RuntimeError("Falta GOOGLE_CREDS_JSON o GOOGLE_CREDS_JSON_TEXT.")
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_JSON, scopes=scopes)
+
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SHEET_ID)
     return sh
