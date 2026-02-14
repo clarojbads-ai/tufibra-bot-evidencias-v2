@@ -1162,7 +1162,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /estado  → ver estado\n"
             "• /cancelar → cancelar caso\n"
             "• /id → ver chat_id del grupo\n"
-            "• /aprobacion on|off → activar/desactivar validaciones\n"
+            "• /aprobacion on|off → activar/desactivar validaciones (solo admins)\n"
         ),
     )
 
@@ -1187,7 +1187,7 @@ async def inicio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     create_or_reset_case(chat_id, user_id, username)
 
     approval_required = get_approval_required(chat_id)
-    extra = "✅ Aprobación: ON (requiere admin)" if approval_required else "⚠️ Aprobación: OFF (modo libre)"
+    extra = "✅ Aprobación: ON (requiere admin)" if approval_required else "⚠️ Aprobación: OFF (auto-aprobación)"
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1221,7 +1221,7 @@ async def estado_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     approval_required = get_approval_required(msg.chat_id)
-    approval_txt = "ON ✅" if approval_required else "OFF ⚠️"
+    approval_txt = "ON ✅" if approval_required else "OFF ⚠️ (auto)"
 
     await context.bot.send_message(
         chat_id=msg.chat_id,
@@ -1244,19 +1244,24 @@ async def aprobacion_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg is None or msg.from_user is None:
         return
 
+    # REGLA: Solo admins pueden cambiar ON/OFF
+    if not await is_admin_of_chat(context, msg.chat_id, msg.from_user.id):
+        await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Solo Administradores del grupo pueden usar /aprobacion on|off.")
+        return
+
     args = context.args or []
     if not args:
-        state = "ON ✅" if get_approval_required(msg.chat_id) else "OFF ⚠️"
+        state = "ON ✅" if get_approval_required(msg.chat_id) else "OFF ⚠️ (auto)"
         await context.bot.send_message(chat_id=msg.chat_id, text=f"Estado de aprobación: {state}")
         return
 
     val = args[0].strip().lower()
     if val in ("on", "1", "true", "si", "sí", "activar"):
         set_approval_required(msg.chat_id, True)
-        await context.bot.send_message(chat_id=msg.chat_id, text="✅ Aprobación ENCENDIDA.")
+        await context.bot.send_message(chat_id=msg.chat_id, text="✅ Aprobación ENCENDIDA. Se requiere validación de admins.")
     elif val in ("off", "0", "false", "no", "desactivar"):
         set_approval_required(msg.chat_id, False)
-        await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Aprobación APAGADA.")
+        await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Aprobación APAGADA. Los pasos se auto-aprobarán (APROBACION OFF).")
     else:
         await context.bot.send_message(chat_id=msg.chat_id, text="Uso: /aprobacion on  o  /aprobacion off")
 
@@ -1284,7 +1289,14 @@ def enqueue_evidencia_row(case_row: sqlite3.Row, step_no: int, attempt: int, fil
     outbox_enqueue("EVIDENCIAS", "UPSERT", dedupe_key, row)
 
 
-def enqueue_detalle_paso_row(case_id: int, step_no: int, attempt: int, estado_paso: str, reviewer_name: str, motivo: str):
+def enqueue_detalle_paso_row(case_id: int, sheet_step_no: int, attempt: int, estado_paso: str, reviewer_name: str, motivo: str, kind: str = "EVID"):
+    """
+    kind:
+      - "EVID": evidencia normal
+      - "PERM": permiso (autorización) asociado al paso real (sheet_step_no positivo)
+    NOTA: en Sheets NO usamos step_no negativo. Para permisos, sheet_step_no debe ser el paso real (5..15),
+          y el paso_nombre se registrará como "PERMISO - <NOMBRE>".
+    """
     case_row = get_case(case_id)
     if not case_row:
         return
@@ -1293,13 +1305,23 @@ def enqueue_detalle_paso_row(case_id: int, step_no: int, attempt: int, estado_pa
     dt = parse_iso(reviewed_at)
     fecha = dt.astimezone(PERU_TZ).strftime("%Y-%m-%d") if dt else ""
     hora = dt.astimezone(PERU_TZ).strftime("%H:%M") if dt else ""
-    paso_nombre = STEP_MEDIA_DEFS.get(step_no, (f"PASO {step_no}",))[0]
-    fotos = media_count(case_id, step_no, attempt)
-    ids = ",".join([str(x) for x in media_message_ids(case_id, step_no, attempt)])
+
+    base_name = STEP_MEDIA_DEFS.get(sheet_step_no, (f"PASO {sheet_step_no}",))[0]
+    if kind == "PERM":
+        paso_nombre = f"PERMISO - {base_name}"
+    else:
+        paso_nombre = base_name
+
+    # cantidad_fotos / ids_mensajes deben salir del step correspondiente en DB:
+    # - evidencias: step_no DB = +sheet_step_no
+    # - permisos:   step_no DB = -sheet_step_no
+    db_step_no = -sheet_step_no if kind == "PERM" else sheet_step_no
+    fotos = media_count(case_id, db_step_no, attempt)
+    ids = ",".join([str(x) for x in media_message_ids(case_id, db_step_no, attempt)])
 
     row = {
         "case_id": str(case_id),
-        "paso_numero": str(step_no),
+        "paso_numero": str(sheet_step_no),
         "paso_nombre": paso_nombre,
         "attempt": str(attempt),
         "estado_paso": estado_paso,
@@ -1310,7 +1332,8 @@ def enqueue_detalle_paso_row(case_id: int, step_no: int, attempt: int, estado_pa
         "cantidad_fotos": str(fotos),
         "ids_mensajes": ids,
     }
-    dedupe_key = f"{case_id}|{step_no}|{attempt}"
+    # dedupe_key separado para evitar colisión entre EVID y PERM con mismo attempt
+    dedupe_key = f"{case_id}|{sheet_step_no}|{attempt}|{kind}"
     outbox_enqueue("DETALLE_PASOS", "UPSERT", dedupe_key, row)
 
 
@@ -1365,6 +1388,25 @@ def enqueue_caso_row(case_id: int):
     }
     dedupe_key = str(case_id)
     outbox_enqueue("CASOS", "UPSERT", dedupe_key, row)
+
+
+# =========================
+# Auto-approval helpers (Aprobacion OFF)
+# =========================
+def auto_approve_db_step(case_id: int, db_step_no: int, attempt: int):
+    """
+    Marca submitted=1 y approved=1, con reviewed_by=0 (sistema) y reviewed_at=now.
+    """
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE step_state
+            SET submitted=1, approved=1, reviewed_by=?, reviewed_at=?
+            WHERE case_id=? AND step_no=? AND attempt=?
+            """,
+            (0, now_utc(), case_id, db_step_no, attempt),
+        )
+        conn.commit()
 
 
 # =========================
@@ -1652,8 +1694,11 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = ensure_step_state(case_id, auth_step_no)
         attempt = int(st["attempt"])
 
-        if int(st["submitted"]) == 1:
+        if int(st["submitted"]) == 1 and st["approved"] is None:
             await safe_q_answer(q, "Esta autorización ya fue enviada a revisión.", show_alert=True)
+            return
+        if st["approved"] is not None and int(st["approved"]) == 1:
+            await safe_q_answer(q, "✅ Esta autorización ya está aprobada.", show_alert=True)
             return
 
         count = media_count(case_id, auth_step_no, attempt)
@@ -1661,6 +1706,21 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_q_answer(q, "⚠️ Debes cargar al menos 1 archivo.", show_alert=True)
             return
 
+        approval_required = get_approval_required(int(case_row["chat_id"]))
+
+        if not approval_required:
+            # AUTO-APROBACIÓN (APROBACION OFF): no enviar mensaje de admins
+            auto_approve_db_step(case_id, auth_step_no, attempt)
+            enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", "APROBACION OFF", "", kind="PERM")
+
+            await safe_q_answer(q, "✅ Autorización aprobada (OFF)", show_alert=False)
+            await safe_edit_message_text(q, "✅ Autorización aprobada automáticamente (APROBACION OFF). Continuando a CARGAR FOTO…")
+
+            update_case(case_id, phase="STEP_MEDIA", pending_step_no=step_no)
+            await context.bot.send_message(chat_id=chat_id, text=prompt_media_step(step_no))
+            return
+
+        # Aprobación ON: flujo normal (admins validan)
         mark_submitted(case_id, auth_step_no, attempt)
         await safe_q_answer(q, "📨 Enviado a revisión", show_alert=False)
 
@@ -1719,6 +1779,8 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "AUT_OK":
             set_review(case_id, auth_step_no, attempt, approved=1, reviewer_id=user_id)
+            enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", admin_name, "", kind="PERM")
+
             await safe_q_answer(q, "✅ Autorizado", show_alert=False)
             await safe_edit_message_text(q, "✅ Autorizado. Continuando a CARGAR FOTO…")
 
@@ -1782,8 +1844,11 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = ensure_step_state(case_id, step_no)
         attempt = int(st["attempt"])
 
-        if int(st["submitted"]) == 1:
+        if int(st["submitted"]) == 1 and st["approved"] is None:
             await safe_q_answer(q, "Este paso ya fue enviado a revisión.", show_alert=True)
+            return
+        if st["approved"] is not None and int(st["approved"]) == 1:
+            await safe_q_answer(q, "✅ Este paso ya está aprobado.", show_alert=True)
             return
 
         count = media_count(case_id, step_no, attempt)
@@ -1791,10 +1856,77 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_q_answer(q, "⚠️ Debes cargar al menos 1 foto.", show_alert=True)
             return
 
+        title = STEP_MEDIA_DEFS.get(step_no, (f"PASO {step_no}",))[0]
+        approval_required = get_approval_required(int(case_row["chat_id"]))
+        mode = (case_row["install_mode"] or "EXTERNA").strip()
+        tech_id = int(case_row["user_id"])
+
+        if not approval_required:
+            # AUTO-APROBACIÓN: no pedir admins
+            auto_approve_db_step(case_id, step_no, attempt)
+            enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", "APROBACION OFF", "", kind="EVID")
+
+            await safe_q_answer(q, "✅ Aprobado (OFF)", show_alert=False)
+            await safe_edit_message_text(q, "✅ Aprobado automáticamente (APROBACION OFF).")
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ <b>PASO COMPLETADO</b>\n"
+                    f"• Evidencia: <b>{title}</b>\n"
+                    f"• Intento: <b>{attempt}</b>\n"
+                    f"• Evidencias: <b>{count}</b>\n"
+                    f"• Revisado por: <b>APROBACION OFF</b>\n"
+                    f"• Técnico: {mention_user_html(tech_id)}"
+                ),
+                parse_mode="HTML",
+            )
+
+            if is_last_step(mode, step_no):
+                finished_at = now_utc()
+                update_case(case_id, status="CLOSED", phase="CLOSED", finished_at=finished_at, pending_step_no=None)
+
+                enqueue_caso_row(case_id)
+
+                route = get_route_for_chat(int(case_row["chat_id"]))
+                dest_summary = route.get("summary")
+                if dest_summary:
+                    created_at = case_row["created_at"] or "-"
+                    total_evid = total_media_for_case(case_id)
+                    total_rej = total_rejects_for_case(case_id)
+                    dur = duration_minutes(created_at, finished_at)
+                    dur_txt = f"{dur} min" if dur is not None else "-"
+
+                    await context.bot.send_message(
+                        chat_id=dest_summary,
+                        text=(
+                            "🧾 **RESUMEN DE CASO (CERRADO)**\n"
+                            f"Fecha: {fmt_date_pe(created_at)}\n"
+                            f"Hora de Inicio: {fmt_time_pe(created_at)}\n"
+                            f"Hora de Final: {fmt_time_pe(finished_at)}\n"
+                            f"Duración: {dur_txt}\n"
+                            f"Técnico: {case_row['technician_name'] or '-'}\n"
+                            f"Tipo servicio: {case_row['service_type'] or '-'}\n"
+                            f"Código abonado: {case_row['abonado_code'] or '-'}\n"
+                            f"Evidencias totales: {total_evid}\n"
+                            f"Rechazos: {total_rej}\n"
+                            f"Grupo origen: {case_row['chat_id']}\n"
+                        ),
+                        parse_mode="Markdown",
+                    )
+
+                await context.bot.send_message(chat_id=chat_id, text="🧾 Caso COMPLETADO y cerrado.")
+                return
+
+            update_case(case_id, phase="MENU_EVID", pending_step_no=None)
+            case_row2 = get_case(case_id)
+            await context.bot.send_message(chat_id=chat_id, text="➡️ Continúa con el siguiente paso.")
+            await show_evidence_menu(chat_id, context, case_row2)
+            return
+
+        # Aprobación ON: flujo normal (admins validan)
         mark_submitted(case_id, step_no, attempt)
         await safe_q_answer(q, "📨 Enviado a revisión", show_alert=False)
-
-        title = STEP_MEDIA_DEFS.get(step_no, (f"PASO {step_no}",))[0]
 
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1850,7 +1982,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "REV_OK":
             set_review(case_id, step_no, attempt, approved=1, reviewer_id=user_id)
-            enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", admin_name, "")
+            enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", admin_name, "", kind="EVID")
 
             await safe_q_answer(q, "✅ Conforme", show_alert=False)
             await safe_edit_message_text(q, "✅ Conforme.")
@@ -1975,6 +2107,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         set_review(case_id, auth_step_no, attempt, approved=0, reviewer_id=msg.from_user.id)
         set_reject_reason(case_id, auth_step_no, attempt, reason, msg.from_user.id)
+        enqueue_detalle_paso_row(case_id, step_no, attempt, "RECHAZADO", msg.from_user.full_name, reason, kind="PERM")
 
         tech_id = int(pending_auth["tech_user_id"]) if pending_auth["tech_user_id"] is not None else None
         reply_to = int(pending_auth["reply_to_message_id"]) if pending_auth["reply_to_message_id"] is not None else None
@@ -2032,7 +2165,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = STEP_MEDIA_DEFS.get(step_no, (f"PASO {step_no}",))[0]
         mention = mention_user_html(tech_id) if tech_id else "Técnico"
 
-        enqueue_detalle_paso_row(case_id, step_no, attempt, "RECHAZADO", msg.from_user.full_name, reason)
+        enqueue_detalle_paso_row(case_id, step_no, attempt, "RECHAZADO", msg.from_user.full_name, reason, kind="EVID")
 
         await context.bot.send_message(
             chat_id=msg.chat_id,
@@ -2074,9 +2207,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = ensure_step_state(case_id, auth_step_no)
         attempt = int(st["attempt"])
 
-        # FIX: guardar auth_text con step_no NEGATIVO (auth_step_no)
+        # guardar auth_text con step_no NEGATIVO (auth_step_no)
         save_auth_text(case_id, auth_step_no, attempt, text, msg.message_id)
 
+        approval_required = get_approval_required(int(case_row["chat_id"]))
+
+        if not approval_required:
+            # AUTO-APROBACIÓN: no enviar a admins, pasar directo a cargar foto
+            auto_approve_db_step(case_id, auth_step_no, attempt)
+            enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", "APROBACION OFF", "", kind="PERM")
+
+            update_case(case_id, phase="STEP_MEDIA", pending_step_no=step_no)
+
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=(
+                    "✅ Autorización aprobada automáticamente (APROBACION OFF).\n"
+                    "➡️ Continúa con la carga de foto del paso."
+                ),
+            )
+            await context.bot.send_message(chat_id=msg.chat_id, text=prompt_media_step(step_no))
+            return
+
+        # Aprobación ON: flujo normal (admins validan)
         mark_submitted(case_id, auth_step_no, attempt)
         update_case(case_id, phase="AUTH_REVIEW", pending_step_no=step_no)
 
@@ -2089,7 +2242,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Técnico: {case_row['technician_name'] or '-'}\n"
                 f"Servicio: {case_row['service_type'] or '-'}\n"
                 f"Abonado: {case_row['abonado_code'] or '-'}\n\n"
-                f"Texto:\n{text}"
+                f"Texto:\n{text}\n\n"
+                "Admins: validar con ✅/❌"
             ),
             parse_mode="Markdown",
             reply_markup=kb_auth_review(case_id, step_no, attempt),
@@ -2200,8 +2354,11 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = ensure_step_state(case_id, step_no_to_store)
     attempt = int(st["attempt"])
 
-    if int(st["submitted"]) == 1:
+    if int(st["submitted"]) == 1 and st["approved"] is None:
         await context.bot.send_message(chat_id=msg.chat_id, text="⏳ Ya está en revisión. Espera validación del administrador.")
+        return
+    if st["approved"] is not None and int(st["approved"]) == 1:
+        await context.bot.send_message(chat_id=msg.chat_id, text="✅ Ya está aprobado. Continúa con el menú.")
         return
 
     current = media_count(case_id, step_no_to_store, attempt)
