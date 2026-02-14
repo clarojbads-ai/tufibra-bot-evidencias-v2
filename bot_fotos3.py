@@ -1,4 +1,3 @@
-# ===== INICIO PARTE 1 =====
 # bot_fotos.py
 # Requisitos:
 #   pip install -U python-telegram-bot==21.6 gspread google-auth
@@ -24,6 +23,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram.error import BadRequest
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -102,6 +103,7 @@ STEP_MEDIA_DEFS = {
 # Google Sheets CONFIG
 # =========================
 SHEET_ID = os.getenv("SHEET_ID", "").strip()
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "").strip()
 GOOGLE_CREDS_JSON_TEXT = os.getenv("GOOGLE_CREDS_JSON_TEXT", "").strip()
 BOT_VERSION = os.getenv("BOT_VERSION", "1.0.0").strip()
 
@@ -129,6 +131,54 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("tufibra_bot")
+
+
+# =========================
+# Safe Telegram helpers (anti-crash callbacks)
+# =========================
+async def safe_q_answer(q, text: Optional[str] = None, show_alert: bool = False) -> None:
+    """
+    Evita crash por:
+    - Query is too old and response timeout expired or query id is invalid
+    - Invalid callback query
+    """
+    if q is None:
+        return
+    try:
+        await q.answer(text=text, show_alert=show_alert, cache_time=0)
+    except BadRequest as e:
+        msg = str(e).lower()
+        if "query is too old" in msg or "response timeout expired" in msg or "query id is invalid" in msg:
+            return
+        if "invalid callback query" in msg:
+            return
+        # Otros BadRequest: no tumbar bot
+        log.warning(f"safe_q_answer BadRequest: {e}")
+    except Exception as e:
+        log.warning(f"safe_q_answer error: {e}")
+
+
+async def safe_edit_message_text(q, text: str, **kwargs) -> None:
+    """
+    Evita crash por:
+    - Message is not modified
+    - Message to edit not found
+    """
+    if q is None:
+        return
+    try:
+        await q.edit_message_text(text=text, **kwargs)
+    except BadRequest as e:
+        msg = str(e).lower()
+        if "message is not modified" in msg:
+            return
+        if "message to edit not found" in msg:
+            return
+        if "query is too old" in msg or "response timeout expired" in msg or "query id is invalid" in msg:
+            return
+        log.warning(f"safe_edit_message_text BadRequest: {e}")
+    except Exception as e:
+        log.warning(f"safe_edit_message_text error: {e}")
 
 
 # =========================
@@ -450,11 +500,20 @@ def get_route_for_chat(origin_chat_id: int) -> Dict[str, Optional[int]]:
         return {"evidence": None, "summary": None}
 
 
-async def maybe_copy_to_group(context: ContextTypes.DEFAULT_TYPE, dest_chat_id: Optional[int], file_id: str, caption: str):
+async def maybe_copy_to_group(
+    context: ContextTypes.DEFAULT_TYPE,
+    dest_chat_id: Optional[int],
+    file_type: str,
+    file_id: str,
+    caption: str,
+):
     if not dest_chat_id:
         return
     try:
-        await context.bot.send_photo(chat_id=dest_chat_id, photo=file_id, caption=caption[:1024])
+        if file_type == "video":
+            await context.bot.send_video(chat_id=dest_chat_id, video=file_id, caption=caption[:1024])
+        else:
+            await context.bot.send_photo(chat_id=dest_chat_id, photo=file_id, caption=caption[:1024])
     except Exception as e:
         log.warning(f"No pude copiar evidencia a destino {dest_chat_id}: {e}")
 
@@ -557,7 +616,16 @@ def total_approved_steps_for_case(case_id: int) -> int:
         return int(row["c"] or 0)
 
 
-def add_media(case_id: int, step_no: int, attempt: int, file_id: str, file_unique_id: Optional[str], tg_message_id: int, meta: Dict[str, Any]):
+def add_media(
+    case_id: int,
+    step_no: int,
+    attempt: int,
+    file_type: str,
+    file_id: str,
+    file_unique_id: Optional[str],
+    tg_message_id: int,
+    meta: Dict[str, Any],
+):
     with db() as conn:
         conn.execute(
             """
@@ -568,7 +636,7 @@ def add_media(case_id: int, step_no: int, attempt: int, file_id: str, file_uniqu
                 case_id,
                 step_no,
                 attempt,
-                "photo",
+                file_type,
                 file_id,
                 file_unique_id or "",
                 tg_message_id,
@@ -614,14 +682,17 @@ def set_reject_reason(case_id: int, step_no: int, attempt: int, reason: str, rev
         conn.commit()
 
 
-def save_auth_text(case_id: int, step_no: int, attempt: int, text: str, tg_message_id: int):
+def save_auth_text(case_id: int, auth_step_no: int, attempt: int, text: str, tg_message_id: int):
+    """
+    auth_step_no DEBE ser negativo (ej: -6) para que no se mezcle con el paso real.
+    """
     with db() as conn:
         conn.execute(
             """
             INSERT INTO auth_text(case_id, step_no, attempt, text, tg_message_id, created_at)
             VALUES(?,?,?,?,?,?)
             """,
-            (case_id, step_no, attempt, text, tg_message_id, now_utc()),
+            (case_id, auth_step_no, attempt, text, tg_message_id, now_utc()),
         )
         conn.commit()
 
@@ -754,7 +825,6 @@ def sheets_client():
 
     # Prioridad 1: JSON en texto (Railway)
     if GOOGLE_CREDS_JSON_TEXT:
-        import json
         creds_info = json.loads(GOOGLE_CREDS_JSON_TEXT)
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
 
@@ -857,9 +927,6 @@ def _is_permanent_sheet_error(err: str) -> bool:
         return True
     return False
 
-
-# ===== FIN PARTE 1 =====
-# ===== INICIO PARTE 2 =====
 
 # =========================
 # Admin helper
@@ -967,15 +1034,6 @@ def kb_action_menu(case_id: int, step_no: int) -> InlineKeyboardMarkup:
     )
 
 
-def kb_auth_ask(case_id: int, step_no: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("SI", callback_data=f"AUTH_ASK|{case_id}|{step_no}|YES"),
-            InlineKeyboardButton("NO", callback_data=f"AUTH_ASK|{case_id}|{step_no}|NO"),
-        ]]
-    )
-
-
 def kb_auth_mode(case_id: int, step_no: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[
@@ -1051,10 +1109,12 @@ def prompt_media_step(step_no: int) -> str:
     )
 
 
-def prompt_auth_question(step_no: int) -> str:
+def prompt_auth_media_step(step_no: int) -> str:
+    title = STEP_MEDIA_DEFS.get(step_no, (f"PASO {step_no}",))[0]
     return (
-        f"Antes de iniciar {STEP_MEDIA_DEFS.get(step_no, (f'PASO {step_no}',))[0]}:\n\n"
-        "¿Quieres solicitar alguna autorización?"
+        f"Autorización multimedia para {title}\n"
+        f"📎 Carga entre 1 a {MAX_MEDIA_PER_STEP} archivos.\n"
+        f"✅ En este paso (PERMISO) se acepta FOTO o VIDEO."
     )
 
 
@@ -1200,8 +1260,6 @@ async def aprobacion_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(chat_id=msg.chat_id, text="Uso: /aprobacion on  o  /aprobacion off")
 
-# ===== FIN PARTE 2 =====
-# ===== INICIO PARTE 3 =====
 
 # =========================
 # Sheets writers (enqueue)
@@ -1310,7 +1368,7 @@ def enqueue_caso_row(case_id: int):
 
 
 # =========================
-# Sheets worker
+# Sheets worker (reintentos)
 # =========================
 async def sheets_worker(context: ContextTypes.DEFAULT_TYPE):
     if "sheets_ready" not in context.application.bot_data:
@@ -1318,7 +1376,6 @@ async def sheets_worker(context: ContextTypes.DEFAULT_TYPE):
     if not context.application.bot_data.get("sheets_ready"):
         return
 
-    sh = context.application.bot_data["sh"]
     ws_casos = context.application.bot_data["ws_casos"]
     ws_det = context.application.bot_data["ws_det"]
     ws_evid = context.application.bot_data["ws_evid"]
@@ -1355,6 +1412,8 @@ async def sheets_worker(context: ContextTypes.DEFAULT_TYPE):
             dead = _is_permanent_sheet_error(err) or attempts >= 8
             outbox_mark_failed(outbox_id, attempts, err, dead=dead)
             log.warning(f"Sheets worker error outbox_id={outbox_id} sheet={sheet_name} attempts={attempts}: {err}")
+            # Pequeña pausa para no golpear Sheets si hay ráfagas de error
+            await context.application.bot.loop.run_in_executor(None, time.sleep, 0.2)
 
 
 # =========================
@@ -1374,10 +1433,10 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "BACK|MODE":
         case_row = get_open_case(chat_id, user_id)
         if not case_row:
-            await q.answer("No tienes un caso abierto.", show_alert=True)
+            await safe_q_answer(q, "No tienes un caso abierto.", show_alert=True)
             return
         update_case(int(case_row["case_id"]), phase="MENU_INST", pending_step_no=None)
-        await q.answer("Volviendo…", show_alert=False)
+        await safe_q_answer(q, "Volviendo…", show_alert=False)
         await context.bot.send_message(
             chat_id=chat_id,
             text="PASO 5 - TIPO DE INSTALACIÓN\nSelecciona una opción:",
@@ -1388,53 +1447,53 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("TECH|"):
         case_row = get_open_case(chat_id, user_id)
         if not case_row:
-            await q.answer("No tienes un caso abierto. Usa /inicio.", show_alert=True)
+            await safe_q_answer(q, "No tienes un caso abierto. Usa /inicio.", show_alert=True)
             return
         if int(case_row["step_index"]) != 0:
-            await q.answer("Este paso ya fue atendido.", show_alert=False)
+            await safe_q_answer(q, "Este paso ya fue atendido.", show_alert=False)
             return
 
         name = data.split("|", 1)[1]
         update_case(int(case_row["case_id"]), technician_name=name, step_index=1, phase="WAIT_SERVICE")
-        await q.answer("✅ Técnico registrado")
+        await safe_q_answer(q, "✅ Técnico registrado", show_alert=False)
         await context.bot.send_message(chat_id=chat_id, text="PASO 2 - TIPO DE SERVICIO", reply_markup=kb_services())
         return
 
     if data.startswith("SERV|"):
         case_row = get_open_case(chat_id, user_id)
         if not case_row:
-            await q.answer("No tienes un caso abierto. Usa /inicio.", show_alert=True)
+            await safe_q_answer(q, "No tienes un caso abierto. Usa /inicio.", show_alert=True)
             return
         if int(case_row["step_index"]) != 1:
-            await q.answer("Este paso ya fue atendido.", show_alert=False)
+            await safe_q_answer(q, "Este paso ya fue atendido.", show_alert=False)
             return
 
         service = data.split("|", 1)[1]
         if service != "ALTA NUEVA":
-            await q.answer("PROCESO AUN NO GENERADO", show_alert=True)
+            await safe_q_answer(q, "PROCESO AUN NO GENERADO", show_alert=True)
             return
 
         update_case(int(case_row["case_id"]), service_type=service, step_index=2, phase="WAIT_ABONADO")
-        await q.answer("✅ Servicio registrado")
+        await safe_q_answer(q, "✅ Servicio registrado", show_alert=False)
         await context.bot.send_message(chat_id=chat_id, text=prompt_step3())
         return
 
     if data.startswith("MODE|"):
         case_row = get_open_case(chat_id, user_id)
         if not case_row:
-            await q.answer("No tienes un caso abierto. Usa /inicio.", show_alert=True)
+            await safe_q_answer(q, "No tienes un caso abierto. Usa /inicio.", show_alert=True)
             return
         if int(case_row["step_index"]) != 4:
-            await q.answer("Aún no llegas a este paso. Completa pasos previos.", show_alert=True)
+            await safe_q_answer(q, "Aún no llegas a este paso. Completa pasos previos.", show_alert=True)
             return
 
         mode = data.split("|", 1)[1]
         if mode not in ("EXTERNA", "INTERNA"):
-            await q.answer("Modo inválido.", show_alert=True)
+            await safe_q_answer(q, "Modo inválido.", show_alert=True)
             return
 
         update_case(int(case_row["case_id"]), install_mode=mode, phase="MENU_EVID", pending_step_no=None)
-        await q.answer(f"✅ {mode}")
+        await safe_q_answer(q, f"✅ {mode}", show_alert=False)
         case_row2 = get_case(int(case_row["case_id"]))
         await show_evidence_menu(chat_id, context, case_row2)
         return
@@ -1445,15 +1504,15 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             num = int(num_s)
             step_no = int(step_no_s)
         except Exception:
-            await q.answer("Callback inválido", show_alert=True)
+            await safe_q_answer(q, "Callback inválido", show_alert=True)
             return
 
         case_row = get_open_case(chat_id, user_id)
         if not case_row:
-            await q.answer("No tienes un caso abierto. Usa /inicio.", show_alert=True)
+            await safe_q_answer(q, "No tienes un caso abierto. Usa /inicio.", show_alert=True)
             return
         if (case_row["install_mode"] or "") != mode:
-            await q.answer("Modo no coincide con el caso.", show_alert=True)
+            await safe_q_answer(q, "Modo no coincide con el caso.", show_alert=True)
             return
 
         case_id = int(case_row["case_id"])
@@ -1461,29 +1520,29 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_num, req_label, req_step_no, req_status = compute_next_required_step(case_id, mode)
 
         if req_status == "DONE":
-            await q.answer("✅ Caso ya completado.", show_alert=True)
+            await safe_q_answer(q, "✅ Caso ya completado.", show_alert=True)
             return
 
         if step_no != req_step_no:
             latest = get_latest_submitted_state(case_id, step_no)
             if latest and latest["approved"] is not None and int(latest["approved"]) == 1:
-                await q.answer("✅ Este paso ya está conforme.", show_alert=True)
+                await safe_q_answer(q, "✅ Este paso ya está conforme.", show_alert=True)
                 return
 
             st = step_status(case_id, step_no)
             if st == "IN_REVIEW":
-                await q.answer("⏳ Este paso está en revisión de admin.", show_alert=True)
+                await safe_q_answer(q, "⏳ Este paso está en revisión de admin.", show_alert=True)
                 return
 
-            await q.answer(f"⚠️ Debes completar primero: {req_num}. {req_label}", show_alert=True)
+            await safe_q_answer(q, f"⚠️ Debes completar primero: {req_num}. {req_label}", show_alert=True)
             return
 
         if req_status == "IN_REVIEW":
-            await q.answer("⏳ Este paso está en revisión de admin. Espera validación.", show_alert=True)
+            await safe_q_answer(q, "⏳ Este paso está en revisión de admin. Espera validación.", show_alert=True)
             return
 
         update_case(case_id, phase="EVID_ACTION", pending_step_no=step_no)
-        await q.answer("Continuar…")
+        await safe_q_answer(q, "Continuar…", show_alert=False)
         label = STEP_MEDIA_DEFS.get(step_no, (f"PASO {step_no}", ""))[0]
 
         await context.bot.send_message(
@@ -1499,62 +1558,37 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             case_id = int(case_id_s)
             step_no = int(step_no_s)
         except Exception:
-            await q.answer("Callback inválido", show_alert=True)
+            await safe_q_answer(q, "Callback inválido", show_alert=True)
             return
 
         case_row = get_case(case_id)
         if not case_row or case_row["status"] != "OPEN":
-            await q.answer("Caso no válido o cerrado.", show_alert=True)
+            await safe_q_answer(q, "Caso no válido o cerrado.", show_alert=True)
             return
         if int(case_row["user_id"]) != user_id:
-            await q.answer("Solo el técnico del caso puede usar esto.", show_alert=True)
+            await safe_q_answer(q, "Solo el técnico del caso puede usar esto.", show_alert=True)
             return
 
         if action == "PERMISO":
-            update_case(case_id, phase="AUTH_ASK", pending_step_no=step_no)
-            await q.answer("Permiso…")
+            # CAMBIO ACORDADO:
+            # - El botón SOLICITUD DE PERMISO ya NO pregunta "¿Quieres solicitar alguna autorización?"
+            # - Va DIRECTO al selector: Solo texto / Multimedia
+            update_case(case_id, phase="AUTH_MODE", pending_step_no=step_no)
+            await safe_q_answer(q, "Permiso…", show_alert=False)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=prompt_auth_question(step_no),
-                reply_markup=kb_auth_ask(case_id, step_no),
+                text="Autorización: elige el tipo",
+                reply_markup=kb_auth_mode(case_id, step_no),
             )
             return
 
         if action == "FOTO":
             update_case(case_id, phase="STEP_MEDIA", pending_step_no=step_no)
-            await q.answer("Cargar foto…")
+            await safe_q_answer(q, "Cargar foto…", show_alert=False)
             await context.bot.send_message(chat_id=chat_id, text=prompt_media_step(step_no))
             return
 
-        await q.answer("Acción inválida.", show_alert=True)
-        return
-
-    if data.startswith("AUTH_ASK|"):
-        try:
-            _, case_id_s, step_no_s, yn = data.split("|", 3)
-            case_id = int(case_id_s)
-            step_no = int(step_no_s)
-        except Exception:
-            await q.answer("Callback inválido", show_alert=True)
-            return
-
-        case_row = get_case(case_id)
-        if not case_row or case_row["status"] != "OPEN":
-            await q.answer("Caso no válido o cerrado.", show_alert=True)
-            return
-        if int(case_row["user_id"]) != user_id:
-            await q.answer("Solo el técnico del caso puede responder.", show_alert=True)
-            return
-
-        if yn == "NO":
-            update_case(case_id, phase="EVID_ACTION", pending_step_no=step_no)
-            await q.answer("OK")
-            await context.bot.send_message(chat_id=chat_id, text="Elige una opción:", reply_markup=kb_action_menu(case_id, step_no))
-            return
-
-        update_case(case_id, phase="AUTH_MODE", pending_step_no=step_no)
-        await q.answer("Elige tipo…")
-        await context.bot.send_message(chat_id=chat_id, text="Autorización: elige el tipo", reply_markup=kb_auth_mode(case_id, step_no))
+        await safe_q_answer(q, "Acción inválida.", show_alert=True)
         return
 
     if data.startswith("AUTH_MODE|"):
@@ -1563,41 +1597,38 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             case_id = int(case_id_s)
             step_no = int(step_no_s)
         except Exception:
-            await q.answer("Callback inválido", show_alert=True)
+            await safe_q_answer(q, "Callback inválido", show_alert=True)
             return
 
         case_row = get_case(case_id)
         if not case_row or case_row["status"] != "OPEN":
-            await q.answer("Caso no válido o cerrado.", show_alert=True)
+            await safe_q_answer(q, "Caso no válido o cerrado.", show_alert=True)
             return
         if int(case_row["user_id"]) != user_id:
-            await q.answer("Solo el técnico del caso puede elegir.", show_alert=True)
+            await safe_q_answer(q, "Solo el técnico del caso puede elegir.", show_alert=True)
             return
 
         if mode == "TEXT":
             update_case(case_id, phase="AUTH_TEXT_WAIT", pending_step_no=step_no)
-            await q.answer("Envía el texto…")
+            await safe_q_answer(q, "Envía el texto…", show_alert=False)
             await context.bot.send_message(chat_id=chat_id, text="Envía el texto de la autorización (en un solo mensaje).")
             return
 
         if mode == "MEDIA":
             update_case(case_id, phase="AUTH_MEDIA", pending_step_no=step_no)
-            await q.answer("Carga evidencias…")
+            await safe_q_answer(q, "Carga evidencias…", show_alert=False)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"Autorización multimedia para {STEP_MEDIA_DEFS.get(step_no, (f'PASO {step_no}',))[0]}\n"
-                    f"📸 Carga entre 1 a {MAX_MEDIA_PER_STEP} fotos (solo se acepta fotos)."
-                ),
+                text=prompt_auth_media_step(step_no),
                 reply_markup=kb_auth_media_controls(case_id, step_no),
             )
             return
 
-        await q.answer("Modo inválido", show_alert=True)
+        await safe_q_answer(q, "Modo inválido", show_alert=True)
         return
 
     if data.startswith("AUTH_MORE|"):
-        await q.answer("Puedes seguir cargando.", show_alert=False)
+        await safe_q_answer(q, "Puedes seguir cargando.", show_alert=False)
         return
 
     if data.startswith("AUTH_DONE|"):
@@ -1606,15 +1637,15 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             case_id = int(case_id_s)
             step_no = int(step_no_s)
         except Exception:
-            await q.answer("Callback inválido", show_alert=True)
+            await safe_q_answer(q, "Callback inválido", show_alert=True)
             return
 
         case_row = get_case(case_id)
         if not case_row or case_row["status"] != "OPEN":
-            await q.answer("Caso no válido o cerrado.", show_alert=True)
+            await safe_q_answer(q, "Caso no válido o cerrado.", show_alert=True)
             return
         if int(case_row["user_id"]) != user_id:
-            await q.answer("Solo el técnico del caso puede marcar evidencias completas.", show_alert=True)
+            await safe_q_answer(q, "Solo el técnico del caso puede marcar evidencias completas.", show_alert=True)
             return
 
         auth_step_no = -step_no
@@ -1622,16 +1653,16 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         attempt = int(st["attempt"])
 
         if int(st["submitted"]) == 1:
-            await q.answer("Esta autorización ya fue enviada a revisión.", show_alert=True)
+            await safe_q_answer(q, "Esta autorización ya fue enviada a revisión.", show_alert=True)
             return
 
         count = media_count(case_id, auth_step_no, attempt)
         if count <= 0:
-            await q.answer("⚠️ Debes cargar al menos 1 foto.", show_alert=True)
+            await safe_q_answer(q, "⚠️ Debes cargar al menos 1 archivo.", show_alert=True)
             return
 
         mark_submitted(case_id, auth_step_no, attempt)
-        await q.answer("📨 Enviado a revisión")
+        await safe_q_answer(q, "📨 Enviado a revisión", show_alert=False)
 
         await context.bot.send_message(
             chat_id=chat_id,
@@ -1657,16 +1688,16 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             step_no = int(step_no_s)
             attempt = int(attempt_s)
         except Exception:
-            await q.answer("Callback inválido", show_alert=True)
+            await safe_q_answer(q, "Callback inválido", show_alert=True)
             return
 
         if not await is_admin_of_chat(context, chat_id, user_id):
-            await q.answer("Solo Administradores del grupo pueden validar", show_alert=True)
+            await safe_q_answer(q, "Solo Administradores del grupo pueden validar", show_alert=True)
             return
 
         case_row = get_case(case_id)
         if not case_row or case_row["status"] != "OPEN":
-            await q.answer("Caso no válido o cerrado.", show_alert=True)
+            await safe_q_answer(q, "Caso no válido o cerrado.", show_alert=True)
             return
 
         auth_step_no = -step_no
@@ -1677,10 +1708,10 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (case_id, auth_step_no, attempt),
             ).fetchone()
         if not row:
-            await q.answer("No encontré la autorización para revisar.", show_alert=True)
+            await safe_q_answer(q, "No encontré la autorización para revisar.", show_alert=True)
             return
         if row["approved"] is not None:
-            await q.answer("Esta autorización ya fue revisada.", show_alert=True)
+            await safe_q_answer(q, "Esta autorización ya fue revisada.", show_alert=True)
             return
 
         tech_id = int(case_row["user_id"])
@@ -1688,8 +1719,8 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if action == "AUT_OK":
             set_review(case_id, auth_step_no, attempt, approved=1, reviewer_id=user_id)
-            await q.answer("✅ Autorizado")
-            await q.edit_message_text("✅ Autorizado. Continuando a CARGAR FOTO…")
+            await safe_q_answer(q, "✅ Autorizado", show_alert=False)
+            await safe_edit_message_text(q, "✅ Autorizado. Continuando a CARGAR FOTO…")
 
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -1701,7 +1732,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=prompt_media_step(step_no))
             return
 
-        await q.answer("Escribe el motivo del rechazo.", show_alert=False)
+        await safe_q_answer(q, "Escribe el motivo del rechazo.", show_alert=False)
 
         set_pending_input(
             chat_id=chat_id,
@@ -1728,7 +1759,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("MEDIA_MORE|"):
-        await q.answer("Puedes seguir cargando evidencias.", show_alert=False)
+        await safe_q_answer(q, "Puedes seguir cargando evidencias.", show_alert=False)
         return
 
     if data.startswith("MEDIA_DONE|"):
@@ -1737,31 +1768,31 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             case_id = int(case_id_s)
             step_no = int(step_no_s)
         except Exception:
-            await q.answer("Callback inválido", show_alert=True)
+            await safe_q_answer(q, "Callback inválido", show_alert=True)
             return
 
         case_row = get_case(case_id)
         if not case_row or case_row["status"] != "OPEN":
-            await q.answer("Caso no válido o cerrado.", show_alert=True)
+            await safe_q_answer(q, "Caso no válido o cerrado.", show_alert=True)
             return
         if int(case_row["user_id"]) != user_id:
-            await q.answer("Solo el técnico del caso puede marcar evidencias completas.", show_alert=True)
+            await safe_q_answer(q, "Solo el técnico del caso puede marcar evidencias completas.", show_alert=True)
             return
 
         st = ensure_step_state(case_id, step_no)
         attempt = int(st["attempt"])
 
         if int(st["submitted"]) == 1:
-            await q.answer("Este paso ya fue enviado a revisión.", show_alert=True)
+            await safe_q_answer(q, "Este paso ya fue enviado a revisión.", show_alert=True)
             return
 
         count = media_count(case_id, step_no, attempt)
         if count <= 0:
-            await q.answer("⚠️ Debes cargar al menos 1 foto.", show_alert=True)
+            await safe_q_answer(q, "⚠️ Debes cargar al menos 1 foto.", show_alert=True)
             return
 
         mark_submitted(case_id, step_no, attempt)
-        await q.answer("📨 Enviado a revisión")
+        await safe_q_answer(q, "📨 Enviado a revisión", show_alert=False)
 
         title = STEP_MEDIA_DEFS.get(step_no, (f"PASO {step_no}",))[0]
 
@@ -1788,16 +1819,16 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             step_no = int(step_no_s)
             attempt = int(attempt_s)
         except Exception:
-            await q.answer("Callback inválido", show_alert=True)
+            await safe_q_answer(q, "Callback inválido", show_alert=True)
             return
 
         if not await is_admin_of_chat(context, chat_id, user_id):
-            await q.answer("Solo Administradores del grupo pueden validar", show_alert=True)
+            await safe_q_answer(q, "Solo Administradores del grupo pueden validar", show_alert=True)
             return
 
         case_row = get_case(case_id)
         if not case_row or case_row["status"] != "OPEN":
-            await q.answer("Caso no válido o cerrado.", show_alert=True)
+            await safe_q_answer(q, "Caso no válido o cerrado.", show_alert=True)
             return
 
         with db() as conn:
@@ -1806,10 +1837,10 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (case_id, step_no, attempt),
             ).fetchone()
         if not row:
-            await q.answer("No encontré el paso para revisar.", show_alert=True)
+            await safe_q_answer(q, "No encontré el paso para revisar.", show_alert=True)
             return
         if row["approved"] is not None:
-            await q.answer("Este paso ya fue revisado.", show_alert=True)
+            await safe_q_answer(q, "Este paso ya fue revisado.", show_alert=True)
             return
 
         mode = (case_row["install_mode"] or "EXTERNA").strip()
@@ -1821,8 +1852,8 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_review(case_id, step_no, attempt, approved=1, reviewer_id=user_id)
             enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", admin_name, "")
 
-            await q.answer("✅ Conforme")
-            await q.edit_message_text("✅ Conforme.")
+            await safe_q_answer(q, "✅ Conforme", show_alert=False)
+            await safe_edit_message_text(q, "✅ Conforme.")
 
             evids = media_count(case_id, step_no, attempt)
             await context.bot.send_message(
@@ -1880,7 +1911,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_evidence_menu(chat_id, context, case_row2)
             return
 
-        await q.answer("Escribe el motivo del rechazo.", show_alert=False)
+        await safe_q_answer(q, "Escribe el motivo del rechazo.", show_alert=False)
 
         set_pending_input(
             chat_id=chat_id,
@@ -1904,7 +1935,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await q.answer("Acción no válida.", show_alert=True)
+    await safe_q_answer(q, "Acción no válida.", show_alert=True)
 
 
 # =========================
@@ -2023,8 +2054,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not case_row:
         return
 
+    # En fases de carga de archivos, no aceptamos texto.
     if (case_row["phase"] or "") in ("STEP_MEDIA", "AUTH_MEDIA"):
-        await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ En este paso solo se aceptan fotos.")
+        await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ En este paso no se acepta texto. Envía el archivo según corresponda.")
         return
 
     if (case_row["phase"] or "") == "AUTH_TEXT_WAIT":
@@ -2042,7 +2074,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = ensure_step_state(case_id, auth_step_no)
         attempt = int(st["attempt"])
 
-        save_auth_text(case_id, step_no, attempt, text, msg.message_id)
+        # FIX: guardar auth_text con step_no NEGATIVO (auth_step_no)
+        save_auth_text(case_id, auth_step_no, attempt, text, msg.message_id)
 
         mark_submitted(case_id, auth_step_no, attempt)
         update_case(case_id, phase="AUTH_REVIEW", pending_step_no=step_no)
@@ -2112,7 +2145,9 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Carga de fotos (evidencias + autorización multimedia)
+# Carga de media
+#   - Evidencias normales: SOLO FOTO
+#   - Autorización (permiso) multimedia: FOTO o VIDEO
 # =========================
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg: Message = update.effective_message
@@ -2129,15 +2164,29 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if phase not in ("AUTH_MEDIA", "STEP_MEDIA"):
         if int(case_row["step_index"]) >= 4:
-            await context.bot.send_message(chat_id=msg.chat_id, text="ℹ️ Usa el menú para elegir el paso antes de enviar fotos.")
+            await context.bot.send_message(chat_id=msg.chat_id, text="ℹ️ Usa el menú para elegir el paso antes de enviar archivos.")
         return
 
     if pending_step_no < 5 or pending_step_no > 15:
         return
 
-    if not msg.photo:
-        await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Solo se aceptan fotos en este paso.")
-        return
+    # BLOQUEO ACORDADO:
+    # - En evidencias normales (STEP_MEDIA): solo fotos
+    # - En permisos (AUTH_MEDIA): fotos o videos
+    if phase == "STEP_MEDIA":
+        if not msg.photo:
+            await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ En este paso solo se aceptan FOTOS.")
+            return
+        file_type = "photo"
+    else:
+        # AUTH_MEDIA
+        if msg.photo:
+            file_type = "photo"
+        elif msg.video:
+            file_type = "video"
+        else:
+            await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ En PERMISO multimedia se aceptan FOTO o VIDEO.")
+            return
 
     if phase == "AUTH_MEDIA":
         step_no_to_store = -pending_step_no
@@ -2156,8 +2205,6 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     current = media_count(case_id, step_no_to_store, attempt)
-    remaining = MAX_MEDIA_PER_STEP - current
-
     if current >= MAX_MEDIA_PER_STEP:
         await context.bot.send_message(
             chat_id=msg.chat_id,
@@ -2166,9 +2213,15 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=msg.chat_id, text="Controles:", reply_markup=controls_kb)
         return
 
-    ph = msg.photo[-1]
-    file_id = ph.file_id
-    file_unique_id = ph.file_unique_id
+    # Extraer file_id
+    if file_type == "photo":
+        ph = msg.photo[-1]
+        file_id = ph.file_id
+        file_unique_id = ph.file_unique_id
+    else:
+        vd = msg.video
+        file_id = vd.file_id if vd else ""
+        file_unique_id = vd.file_unique_id if vd else ""
 
     meta = {
         "from_user_id": msg.from_user.id,
@@ -2179,12 +2232,14 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "phase": phase,
         "step_pending": pending_step_no,
         "attempt": attempt,
+        "file_type": file_type,
     }
 
     add_media(
         case_id=case_id,
         step_no=step_no_to_store,
         attempt=attempt,
+        file_type=file_type,
         file_id=file_id,
         file_unique_id=file_unique_id,
         tg_message_id=msg.message_id,
@@ -2197,11 +2252,13 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Técnico: {case_row['technician_name'] or '-'}\n"
         f"Servicio: {case_row['service_type'] or '-'}\n"
         f"Abonado: {case_row['abonado_code'] or '-'}\n"
-        f"Intento: {attempt}"
+        f"Intento: {attempt}\n"
+        f"Tipo: {file_type.upper()}"
     )
-    await maybe_copy_to_group(context, route.get("evidence"), file_id, caption)
+    await maybe_copy_to_group(context, route.get("evidence"), file_type, file_id, caption)
 
-    if phase != "AUTH_MEDIA":
+    # En cola solo para evidencias reales (no permisos)
+    if phase != "AUTH_MEDIA" and file_type == "photo":
         enqueue_evidencia_row(case_row, pending_step_no, attempt, file_id, file_unique_id, msg.message_id, route.get("evidence"))
 
     new_count = current + 1
@@ -2237,7 +2294,9 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Timeouts más robustos (reduce “cuelgues” por red)
+    request = HTTPXRequest(connect_timeout=10, read_timeout=25, write_timeout=25, pool_timeout=10)
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start_cmd))
@@ -2257,7 +2316,7 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # Sheets init + indices + worker
+    # Sheets init + indices + worker (reintentos)
     try:
         sh = sheets_client()
         ws_casos = sh.worksheet("CASOS")
@@ -2295,5 +2354,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ===== FIN PARTE 3 =====
