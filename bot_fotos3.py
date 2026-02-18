@@ -16,6 +16,8 @@ import json
 import sqlite3
 import logging
 import time
+import uuid
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -46,7 +48,8 @@ MAX_MEDIA_PER_STEP = 8
 # Perú (UTC-5)
 PERU_TZ = timezone(timedelta(hours=-5))
 
-TECHNICIANS = [
+# (Deprecated as hardcode) - mantenido solo como fallback si la hoja TECNICOS está vacía o no disponible
+TECHNICIANS_FALLBACK = [
     "FLORO FERNANDEZ VASQUEZ",
     "ANTONY SALVADOR CORONADO",
     "DANIEL EDUARDO LUCENA PIÑANGO",
@@ -107,6 +110,7 @@ GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON", "").strip()
 GOOGLE_CREDS_JSON_TEXT = os.getenv("GOOGLE_CREDS_JSON_TEXT", "").strip()
 BOT_VERSION = os.getenv("BOT_VERSION", "1.0.0").strip()
 
+# Tabs existentes (historial)
 CASOS_COLUMNS = [
     "case_id", "estado", "chat_id_origen", "fecha_inicio", "hora_inicio", "fecha_cierre", "hora_cierre", "duracion_min",
     "tecnico_nombre", "tecnico_user_id", "tipo_servicio", "codigo_abonado", "modo_instalacion", "latitud", "longitud",
@@ -123,6 +127,20 @@ EVIDENCIAS_COLUMNS = [
 ]
 CONFIG_COLUMNS = ["parametro", "valor"]
 
+# Tabs nuevas (config pro)
+TECNICOS_TAB = "TECNICOS"
+ROUTING_TAB = "ROUTING"
+PAIRING_TAB = "PAIRING"
+
+TECNICOS_COLUMNS = ["nombre", "activo", "orden", "alias", "updated_at"]
+ROUTING_COLUMNS = ["origin_chat_id", "evidence_chat_id", "summary_chat_id", "alias", "activo", "updated_by", "updated_at"]
+PAIRING_COLUMNS = ["code", "origin_chat_id", "purpose", "expires_at", "used", "created_by", "created_at", "used_by", "used_at"]
+
+# Cache/refresh
+TECH_CACHE_TTL_SEC = int(os.getenv("TECH_CACHE_TTL_SEC", "180"))     # 3 min default
+ROUTING_CACHE_TTL_SEC = int(os.getenv("ROUTING_CACHE_TTL_SEC", "180"))  # 3 min default
+PAIRING_TTL_MINUTES = int(os.getenv("PAIRING_TTL_MINUTES", "10"))    # 10 min default
+
 # =========================
 # Logging
 # =========================
@@ -131,7 +149,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("tufibra_bot")
-
 
 # =========================
 # Safe Telegram helpers (anti-crash callbacks)
@@ -152,7 +169,6 @@ async def safe_q_answer(q, text: Optional[str] = None, show_alert: bool = False)
             return
         if "invalid callback query" in msg:
             return
-        # Otros BadRequest: no tumbar bot
         log.warning(f"safe_q_answer BadRequest: {e}")
     except Exception as e:
         log.warning(f"safe_q_answer error: {e}")
@@ -179,7 +195,6 @@ async def safe_edit_message_text(q, text: str, **kwargs) -> None:
         log.warning(f"safe_edit_message_text BadRequest: {e}")
     except Exception as e:
         log.warning(f"safe_edit_message_text error: {e}")
-
 
 # =========================
 # DB helpers
@@ -482,22 +497,49 @@ def create_or_reset_case(chat_id: int, user_id: int, username: str) -> sqlite3.R
         new_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
         return get_case(int(new_id))
 
-
 # =========================
-# Routing
+# Routing (Sheets cache + fallback)
 # =========================
-def get_route_for_chat(origin_chat_id: int) -> Dict[str, Optional[int]]:
-    if not ROUTING_JSON:
-        return {"evidence": None, "summary": None}
+def _safe_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
     try:
-        mapping = json.loads(ROUTING_JSON)
-        cfg = mapping.get(str(origin_chat_id)) or {}
-        ev = cfg.get("evidence")
-        sm = cfg.get("summary")
-        return {"evidence": int(ev) if ev else None, "summary": int(sm) if sm else None}
-    except Exception as e:
-        log.warning(f"ROUTING_JSON inválido: {e}")
-        return {"evidence": None, "summary": None}
+        return int(s)
+    except Exception:
+        return None
+
+
+def get_route_for_chat_cached(application: Application, origin_chat_id: int) -> Dict[str, Optional[int]]:
+    """
+    Ruta principal: cache de ROUTING en Sheets.
+    Fallback opcional: ROUTING_JSON.
+    """
+    try:
+        rc = application.bot_data.get("routing_cache") or {}
+        row = rc.get(int(origin_chat_id))
+        if row and int(row.get("activo", 1)) == 1:
+            return {
+                "evidence": _safe_int(row.get("evidence_chat_id")),
+                "summary": _safe_int(row.get("summary_chat_id")),
+            }
+    except Exception:
+        pass
+
+    # Fallback a variable (migración / emergencia)
+    if ROUTING_JSON:
+        try:
+            mapping = json.loads(ROUTING_JSON)
+            cfg = mapping.get(str(origin_chat_id)) or {}
+            ev = cfg.get("evidence")
+            sm = cfg.get("summary")
+            return {"evidence": int(ev) if ev else None, "summary": int(sm) if sm else None}
+        except Exception as e:
+            log.warning(f"ROUTING_JSON inválido: {e}")
+
+    return {"evidence": None, "summary": None}
 
 
 async def maybe_copy_to_group(
@@ -516,7 +558,6 @@ async def maybe_copy_to_group(
             await context.bot.send_photo(chat_id=dest_chat_id, photo=file_id, caption=caption[:1024])
     except Exception as e:
         log.warning(f"No pude copiar evidencia a destino {dest_chat_id}: {e}")
-
 
 # =========================
 # step_state helpers
@@ -730,9 +771,8 @@ def pop_pending_input(chat_id: int, user_id: int, kind: str) -> Optional[sqlite3
             conn.commit()
         return row
 
-
 # =========================
-# Outbox helpers (Google Sheets)
+# Outbox helpers (Google Sheets - historial)
 # =========================
 def outbox_enqueue(sheet_name: str, op_type: str, dedupe_key: str, row: Dict[str, Any]):
     now = now_utc()
@@ -813,7 +853,6 @@ def outbox_mark_failed(outbox_id: int, attempts: int, err: str, dead: bool = Fal
         )
         conn.commit()
 
-
 # =========================
 # Google Sheets helpers
 # =========================
@@ -827,7 +866,6 @@ def sheets_client():
     if GOOGLE_CREDS_JSON_TEXT:
         creds_info = json.loads(GOOGLE_CREDS_JSON_TEXT)
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-
     # Prioridad 2: archivo local (PC)
     else:
         if not GOOGLE_CREDS_JSON:
@@ -912,7 +950,6 @@ def sheet_upsert(ws, index: Dict[str, int], key: str, row: Dict[str, Any], colum
         ws.update(f"{start}:{end}", [values], value_input_option="RAW")
     else:
         ws.append_row(values, value_input_option="RAW")
-        # nueva fila es última
         last_row = len(ws.get_all_values())
         index[key] = last_row
 
@@ -928,6 +965,351 @@ def _is_permanent_sheet_error(err: str) -> bool:
     return False
 
 
+def _safe_str(v: Any) -> str:
+    return str(v).strip() if v is not None else ""
+
+
+def _parse_bool01(v: Any) -> int:
+    s = str(v).strip().lower()
+    if s in ("1", "true", "si", "sí", "on", "activo", "yes"):
+        return 1
+    return 0
+
+
+def _parse_int_or_default(v: Any, default: int) -> int:
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_all_records(ws) -> List[Dict[str, Any]]:
+    # get_all_records devuelve dicts con headers como keys
+    try:
+        return ws.get_all_records()
+    except Exception:
+        # fallback más resistente
+        values = ws.get_all_values()
+        if not values or len(values) < 2:
+            return []
+        headers = values[0]
+        out: List[Dict[str, Any]] = []
+        for r in values[1:]:
+            d = {}
+            for i, h in enumerate(headers):
+                d[h] = r[i] if i < len(r) else ""
+            out.append(d)
+        return out
+
+
+def _find_row_index_by_column(ws, col_name: str, target: str) -> Optional[int]:
+    """
+    Retorna row_index (1-based) donde col_name == target, buscando sobre toda la hoja.
+    """
+    values = ws.get_all_values()
+    if not values:
+        return None
+    headers = values[0]
+    try:
+        ci = headers.index(col_name)
+    except ValueError:
+        return None
+    for idx in range(2, len(values) + 1):
+        row = values[idx - 1]
+        val = row[ci] if ci < len(row) else ""
+        if str(val).strip() == str(target).strip():
+            return idx
+    return None
+
+
+def _update_cells_by_headers(ws, row_index: int, updates: Dict[str, Any]) -> None:
+    """
+    Actualiza celdas de una fila usando headers; updates: {header: value}
+    """
+    values = ws.get_all_values()
+    if not values:
+        raise RuntimeError("Hoja vacía, no puedo actualizar.")
+    headers = values[0]
+    col_map = {h: i + 1 for i, h in enumerate(headers)}  # 1-based col
+    for k, v in updates.items():
+        if k not in col_map:
+            raise RuntimeError(f"Falta columna '{k}' en hoja '{ws.title}'")
+        ws.update_cell(row_index, col_map[k], v)
+
+
+# =========================
+# Sheets config cache loaders
+# =========================
+def load_tecnicos_cache(app: Application) -> None:
+    if not app.bot_data.get("sheets_ready"):
+        return
+    ws = app.bot_data.get("ws_tecnicos")
+    if not ws:
+        return
+    try:
+        _ensure_headers(ws, TECNICOS_COLUMNS)
+        rows = _read_all_records(ws)
+        techs: List[Dict[str, Any]] = []
+        for r in rows:
+            nombre = _safe_str(r.get("nombre"))
+            if not nombre:
+                continue
+            activo = _parse_bool01(r.get("activo"))
+            if activo != 1:
+                continue
+            alias = _safe_str(r.get("alias"))
+            orden = _parse_int_or_default(r.get("orden"), 9999)
+            techs.append({"nombre": nombre, "alias": alias, "orden": orden})
+        techs.sort(key=lambda x: (x.get("orden", 9999), x.get("nombre", "")))
+        app.bot_data["tech_cache"] = techs
+        app.bot_data["tech_cache_at"] = time.time()
+        log.info(f"TECNICOS cache actualizado: {len(techs)} activos.")
+    except Exception as e:
+        log.warning(f"TECNICOS cache error: {e}")
+
+
+def load_routing_cache(app: Application) -> None:
+    if not app.bot_data.get("sheets_ready"):
+        return
+    ws = app.bot_data.get("ws_routing")
+    if not ws:
+        return
+    try:
+        _ensure_headers(ws, ROUTING_COLUMNS)
+        rows = _read_all_records(ws)
+        m: Dict[int, Dict[str, Any]] = {}
+        for r in rows:
+            origin = _safe_int(r.get("origin_chat_id"))
+            if origin is None:
+                continue
+            activo = _parse_bool01(r.get("activo"))
+            if activo != 1:
+                # guardamos igual pero marcado, por si se usa en "ver rutas"
+                m[int(origin)] = {
+                    "origin_chat_id": int(origin),
+                    "evidence_chat_id": _safe_str(r.get("evidence_chat_id")),
+                    "summary_chat_id": _safe_str(r.get("summary_chat_id")),
+                    "alias": _safe_str(r.get("alias")),
+                    "activo": 0,
+                    "updated_by": _safe_str(r.get("updated_by")),
+                    "updated_at": _safe_str(r.get("updated_at")),
+                }
+                continue
+
+            m[int(origin)] = {
+                "origin_chat_id": int(origin),
+                "evidence_chat_id": _safe_str(r.get("evidence_chat_id")),
+                "summary_chat_id": _safe_str(r.get("summary_chat_id")),
+                "alias": _safe_str(r.get("alias")),
+                "activo": 1,
+                "updated_by": _safe_str(r.get("updated_by")),
+                "updated_at": _safe_str(r.get("updated_at")),
+            }
+        app.bot_data["routing_cache"] = m
+        app.bot_data["routing_cache_at"] = time.time()
+        log.info(f"ROUTING cache actualizado: {len(m)} rutas.")
+    except Exception as e:
+        log.warning(f"ROUTING cache error: {e}")
+
+
+async def refresh_config_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Job único que refresca TECNICOS + ROUTING según TTL; evita llamadas excesivas.
+    """
+    app = context.application
+    if not app.bot_data.get("sheets_ready"):
+        return
+
+    now_ts = time.time()
+    tech_at = app.bot_data.get("tech_cache_at", 0)
+    routing_at = app.bot_data.get("routing_cache_at", 0)
+
+    if now_ts - tech_at >= TECH_CACHE_TTL_SEC:
+        load_tecnicos_cache(app)
+    if now_ts - routing_at >= ROUTING_CACHE_TTL_SEC:
+        load_routing_cache(app)
+
+# =========================
+# Sheets pairing (persistencia en Sheets)
+# =========================
+def _gen_pair_code() -> str:
+    # Corto, fácil de copiar
+    raw = uuid.uuid4().hex.upper()
+    return f"PAIR-{raw[:6]}"
+
+
+def pairing_create(app: Application, origin_chat_id: int, purpose: str, created_by: str) -> str:
+    """
+    Crea fila en PAIRING y retorna code.
+    purpose: EVIDENCE | SUMMARY
+    """
+    if not app.bot_data.get("sheets_ready"):
+        raise RuntimeError("Sheets no disponible.")
+    ws = app.bot_data.get("ws_pairing")
+    if not ws:
+        raise RuntimeError("Hoja PAIRING no disponible.")
+
+    _ensure_headers(ws, PAIRING_COLUMNS)
+
+    code = _gen_pair_code()
+    # Asegurar unicidad simple (reintenta pocas veces)
+    for _ in range(3):
+        ri = _find_row_index_by_column(ws, "code", code)
+        if ri is None:
+            break
+        code = _gen_pair_code()
+
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=PAIRING_TTL_MINUTES)).isoformat()
+    created_at = _utc_iso_now()
+
+    row = {
+        "code": code,
+        "origin_chat_id": str(origin_chat_id),
+        "purpose": purpose,
+        "expires_at": expires,
+        "used": "0",
+        "created_by": created_by,
+        "created_at": created_at,
+        "used_by": "",
+        "used_at": "",
+    }
+    ws.append_row([row.get(c, "") for c in PAIRING_COLUMNS], value_input_option="RAW")
+    return code
+
+
+def pairing_consume_and_upsert_routing(
+    app: Application,
+    code: str,
+    dest_chat_id: int,
+    used_by: str,
+    purpose_expected: str,
+    dest_kind: str,
+) -> Dict[str, Any]:
+    """
+    Consume PAIRING (marca used=1) y actualiza ROUTING.
+    dest_kind: 'EVIDENCE' o 'SUMMARY' (destino actual)
+    Retorna dict con info: origin_chat_id, purpose, alias
+    """
+    if not app.bot_data.get("sheets_ready"):
+        raise RuntimeError("Sheets no disponible.")
+    ws_p = app.bot_data.get("ws_pairing")
+    ws_r = app.bot_data.get("ws_routing")
+    if not ws_p or not ws_r:
+        raise RuntimeError("Hojas de configuración no disponibles.")
+
+    _ensure_headers(ws_p, PAIRING_COLUMNS)
+    _ensure_headers(ws_r, ROUTING_COLUMNS)
+
+    code = str(code).strip().upper()
+    row_idx = _find_row_index_by_column(ws_p, "code", code)
+    if row_idx is None:
+        raise RuntimeError("Código no encontrado.")
+
+    # Leer fila
+    values = ws_p.get_all_values()
+    headers = values[0]
+    row = values[row_idx - 1] if row_idx - 1 < len(values) else []
+    col = {h: i for i, h in enumerate(headers)}
+
+    def get_cell(name: str) -> str:
+        i = col.get(name)
+        if i is None:
+            return ""
+        return row[i] if i < len(row) else ""
+
+    used = _parse_bool01(get_cell("used"))
+    if used == 1:
+        raise RuntimeError("Este código ya fue usado.")
+
+    purpose = _safe_str(get_cell("purpose")).upper()
+    if purpose not in ("EVIDENCE", "SUMMARY"):
+        raise RuntimeError("Código inválido (purpose).")
+    if purpose_expected and purpose != purpose_expected:
+        raise RuntimeError(f"Este código es para {purpose}, no para {purpose_expected}.")
+
+    expires_at = _safe_str(get_cell("expires_at"))
+    dt_exp = parse_iso(expires_at)
+    if not dt_exp:
+        raise RuntimeError("Código inválido (expires_at).")
+    if datetime.now(timezone.utc) > dt_exp:
+        raise RuntimeError("Este código está vencido. Genera uno nuevo en el grupo ORIGEN.")
+
+    origin_chat_id = _safe_int(get_cell("origin_chat_id"))
+    if origin_chat_id is None:
+        raise RuntimeError("Código inválido (origin_chat_id).")
+
+    # Marcar como usado
+    used_at = _utc_iso_now()
+    _update_cells_by_headers(ws_p, row_idx, {"used": "1", "used_by": used_by, "used_at": used_at})
+
+    # Upsert ROUTING: buscar fila por origin_chat_id
+    origin_str = str(origin_chat_id)
+    r_idx = _find_row_index_by_column(ws_r, "origin_chat_id", origin_str)
+
+    alias = ""
+    try:
+        # alias sugerido: si el origen ya está en cache
+        rc = app.bot_data.get("routing_cache") or {}
+        if rc.get(int(origin_chat_id)):
+            alias = _safe_str(rc[int(origin_chat_id)].get("alias"))
+    except Exception:
+        pass
+
+    if not alias:
+        alias = f"ORIGEN {origin_chat_id}"
+
+    upd_by = used_by
+    upd_at = _utc_iso_now()
+
+    if r_idx is None:
+        # Crear fila nueva
+        new_row = {
+            "origin_chat_id": origin_str,
+            "evidence_chat_id": str(dest_chat_id) if dest_kind == "EVIDENCE" else "",
+            "summary_chat_id": str(dest_chat_id) if dest_kind == "SUMMARY" else "",
+            "alias": alias,
+            "activo": "1",
+            "updated_by": upd_by,
+            "updated_at": upd_at,
+        }
+        ws_r.append_row([new_row.get(c, "") for c in ROUTING_COLUMNS], value_input_option="RAW")
+    else:
+        # Actualizar fila existente: set dest, activar, updated_*
+        updates = {
+            "activo": "1",
+            "updated_by": upd_by,
+            "updated_at": upd_at,
+        }
+        if dest_kind == "EVIDENCE":
+            updates["evidence_chat_id"] = str(dest_chat_id)
+        else:
+            updates["summary_chat_id"] = str(dest_chat_id)
+        # Si alias está vacío en la hoja, setear
+        # (leemos de la hoja para decidir)
+        vals_r = ws_r.get_all_values()
+        hdr_r = vals_r[0]
+        try:
+            ci_alias = hdr_r.index("alias")
+        except ValueError:
+            ci_alias = None
+        current_alias = ""
+        if ci_alias is not None and (r_idx - 1) < len(vals_r):
+            rr = vals_r[r_idx - 1]
+            current_alias = rr[ci_alias] if ci_alias < len(rr) else ""
+        if not str(current_alias).strip():
+            updates["alias"] = alias
+
+        _update_cells_by_headers(ws_r, r_idx, updates)
+
+    # refrescar cache routing inmediatamente
+    load_routing_cache(app)
+
+    return {"origin_chat_id": int(origin_chat_id), "purpose": purpose, "alias": alias}
+
 # =========================
 # Admin helper
 # =========================
@@ -942,12 +1324,25 @@ async def is_admin_of_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, use
 def mention_user_html(user_id: int, label: str = "Técnico") -> str:
     return f'<a href="tg://user?id={user_id}">{label}</a>'
 
-
 # =========================
 # Keyboards
 # =========================
-def kb_technicians() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(name, callback_data=f"TECH|{name}")] for name in TECHNICIANS]
+def kb_technicians_dynamic(app: Application) -> InlineKeyboardMarkup:
+    techs = app.bot_data.get("tech_cache") or []
+    rows: List[List[InlineKeyboardButton]] = []
+
+    # Si no hay cache, fallback
+    if not techs:
+        for name in TECHNICIANS_FALLBACK:
+            rows.append([InlineKeyboardButton(name, callback_data=f"TECH|{name}")])
+        return InlineKeyboardMarkup(rows)
+
+    for t in techs:
+        nombre = _safe_str(t.get("nombre"))
+        alias = _safe_str(t.get("alias"))
+        label = alias if alias else nombre
+        rows.append([InlineKeyboardButton(label, callback_data=f"TECH|{nombre}")])
+
     return InlineKeyboardMarkup(rows)
 
 
@@ -1000,10 +1395,9 @@ def compute_next_required_step(case_id: int, mode: str) -> Tuple[int, str, int, 
 
 def kb_evidence_menu(case_id: int, mode: str) -> InlineKeyboardMarkup:
     items = get_mode_items(mode)
-    req_num, req_label, req_step_no, req_status = compute_next_required_step(case_id, mode)
+    req_num, req_label, req_step_no, _req_status = compute_next_required_step(case_id, mode)
 
     rows: List[List[InlineKeyboardButton]] = []
-
     rows.append([InlineKeyboardButton("↩️ VOLVER AL MENU ANTERIOR", callback_data="BACK|MODE")])
 
     for num, label, step_no in items:
@@ -1078,6 +1472,27 @@ def kb_review_step(case_id: int, step_no: int, attempt: int) -> InlineKeyboardMa
         ]]
     )
 
+# =========================
+# /config menu (admin-only)
+# =========================
+def kb_config_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔗 Vincular Evidencias", callback_data="CFG|PAIR|EVIDENCE")],
+            [InlineKeyboardButton("🧾 Vincular Resumen", callback_data="CFG|PAIR|SUMMARY")],
+            [InlineKeyboardButton("📌 Ver rutas de este grupo", callback_data="CFG|ROUTE|STATUS")],
+            [InlineKeyboardButton("❌ Cerrar", callback_data="CFG|CLOSE")],
+        ]
+    )
+
+
+def kb_back_to_config() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("↩️ Volver a /config", callback_data="CFG|HOME")],
+            [InlineKeyboardButton("❌ Cerrar", callback_data="CFG|CLOSE")],
+        ]
+    )
 
 # =========================
 # Prompts
@@ -1146,7 +1561,6 @@ def duration_minutes(created_at: str, finished_at: str) -> Optional[int]:
         return None
     return max(0, seconds // 60)
 
-
 # =========================
 # Commands
 # =========================
@@ -1163,6 +1577,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /cancelar → cancelar caso\n"
             "• /id → ver chat_id del grupo\n"
             "• /aprobacion on|off → activar/desactivar validaciones (solo admins)\n"
+            "• /config → menú de configuración (solo admins)\n"
         ),
     )
 
@@ -1173,6 +1588,27 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     title = msg.chat.title if msg.chat else "-"
     await context.bot.send_message(chat_id=msg.chat_id, text=f"Chat ID: {msg.chat_id}\nTitle: {title}")
+
+
+async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if msg is None or msg.from_user is None:
+        return
+    if not await is_admin_of_chat(context, msg.chat_id, msg.from_user.id):
+        await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Solo Administradores del grupo pueden usar /config.")
+        return
+
+    # Forzar refresh suave si la cache está vacía
+    app = context.application
+    if app.bot_data.get("sheets_ready"):
+        if not app.bot_data.get("routing_cache"):
+            load_routing_cache(app)
+
+    await context.bot.send_message(
+        chat_id=msg.chat_id,
+        text="⚙️ CONFIGURACIÓN (Admins)\nSelecciona una opción:",
+        reply_markup=kb_config_menu(),
+    )
 
 
 async def inicio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1189,10 +1625,27 @@ async def inicio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     approval_required = get_approval_required(chat_id)
     extra = "✅ Aprobación: ON (requiere admin)" if approval_required else "⚠️ Aprobación: OFF (auto-aprobación)"
 
+    # Asegurar cache técnicos si posible
+    app = context.application
+    if app.bot_data.get("sheets_ready") and not app.bot_data.get("tech_cache"):
+        load_tecnicos_cache(app)
+
+    # Si aún no hay técnicos activos (ni fallback), avisar
+    tech_cache = app.bot_data.get("tech_cache") or []
+    if not tech_cache and not TECHNICIANS_FALLBACK:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ No hay técnicos activos configurados en la hoja TECNICOS.\n"
+                "Admin: agrega técnicos en Google Sheets (TECNICOS) y vuelve a intentar."
+            ),
+        )
+        return
+
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"✅ Caso iniciado.\n{extra}\n\nPASO 1 - NOMBRE DEL TECNICO",
-        reply_markup=kb_technicians(),
+        reply_markup=kb_technicians_dynamic(app),
     )
 
 
@@ -1265,9 +1718,8 @@ async def aprobacion_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(chat_id=msg.chat_id, text="Uso: /aprobacion on  o  /aprobacion off")
 
-
 # =========================
-# Sheets writers (enqueue)
+# Sheets writers (enqueue) - historial
 # =========================
 def enqueue_evidencia_row(case_row: sqlite3.Row, step_no: int, attempt: int, file_id: str, file_unique_id: str, tg_message_id: int, grupo_evidencias: Optional[int]):
     created_at = now_utc()
@@ -1312,9 +1764,6 @@ def enqueue_detalle_paso_row(case_id: int, sheet_step_no: int, attempt: int, est
     else:
         paso_nombre = base_name
 
-    # cantidad_fotos / ids_mensajes deben salir del step correspondiente en DB:
-    # - evidencias: step_no DB = +sheet_step_no
-    # - permisos:   step_no DB = -sheet_step_no
     db_step_no = -sheet_step_no if kind == "PERM" else sheet_step_no
     fotos = media_count(case_id, db_step_no, attempt)
     ids = ",".join([str(x) for x in media_message_ids(case_id, db_step_no, attempt)])
@@ -1332,7 +1781,6 @@ def enqueue_detalle_paso_row(case_id: int, sheet_step_no: int, attempt: int, est
         "cantidad_fotos": str(fotos),
         "ids_mensajes": ids,
     }
-    # dedupe_key separado para evitar colisión entre EVID y PERM con mismo attempt
     dedupe_key = f"{case_id}|{sheet_step_no}|{attempt}|{kind}"
     outbox_enqueue("DETALLE_PASOS", "UPSERT", dedupe_key, row)
 
@@ -1389,7 +1837,6 @@ def enqueue_caso_row(case_id: int):
     dedupe_key = str(case_id)
     outbox_enqueue("CASOS", "UPSERT", dedupe_key, row)
 
-
 # =========================
 # Auto-approval helpers (Aprobacion OFF)
 # =========================
@@ -1408,9 +1855,8 @@ def auto_approve_db_step(case_id: int, db_step_no: int, attempt: int):
         )
         conn.commit()
 
-
 # =========================
-# Sheets worker (reintentos)
+# Sheets worker (reintentos) - historial
 # =========================
 async def sheets_worker(context: ContextTypes.DEFAULT_TYPE):
     if "sheets_ready" not in context.application.bot_data:
@@ -1454,9 +1900,7 @@ async def sheets_worker(context: ContextTypes.DEFAULT_TYPE):
             dead = _is_permanent_sheet_error(err) or attempts >= 8
             outbox_mark_failed(outbox_id, attempts, err, dead=dead)
             log.warning(f"Sheets worker error outbox_id={outbox_id} sheet={sheet_name} attempts={attempts}: {err}")
-            # Pequeña pausa para no golpear Sheets si hay ráfagas de error
             await context.application.bot.loop.run_in_executor(None, time.sleep, 0.2)
-
 
 # =========================
 # Callbacks
@@ -1472,6 +1916,141 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info(f"CALLBACK data={data} chat_id={chat_id} user_id={user_id}")
 
+    # -------------------------
+    # CONFIG MENU (Admins)
+    # -------------------------
+    if data.startswith("CFG|"):
+        if not await is_admin_of_chat(context, chat_id, user_id):
+            await safe_q_answer(q, "⚠️ Solo administradores.", show_alert=True)
+            return
+
+        parts = data.split("|")
+        # CFG|HOME
+        if data == "CFG|HOME":
+            await safe_q_answer(q, "Config", show_alert=False)
+            await safe_edit_message_text(q, "⚙️ CONFIGURACIÓN (Admins)\nSelecciona una opción:", reply_markup=kb_config_menu())
+            return
+
+        # CFG|CLOSE
+        if data == "CFG|CLOSE":
+            await safe_q_answer(q, "Cerrado", show_alert=False)
+            await safe_edit_message_text(q, "✅ Configuración cerrada.")
+            return
+
+        # CFG|ROUTE|STATUS
+        if len(parts) >= 3 and parts[1] == "ROUTE" and parts[2] == "STATUS":
+            app = context.application
+            if app.bot_data.get("sheets_ready") and not app.bot_data.get("routing_cache"):
+                load_routing_cache(app)
+
+            rc = app.bot_data.get("routing_cache") or {}
+            # Si este chat es ORIGEN
+            row = rc.get(int(chat_id))
+            if row:
+                alias = row.get("alias") or f"ORIGEN {chat_id}"
+                ev = row.get("evidence_chat_id") or ""
+                sm = row.get("summary_chat_id") or ""
+                activo = "✅ Activo" if int(row.get("activo", 1)) == 1 else "⛔ Inactivo"
+                txt = (
+                    f"📌 RUTAS (ORIGEN)\n"
+                    f"Alias: {alias}\n"
+                    f"Origin chat_id: {chat_id}\n"
+                    f"Evidencias chat_id: {ev or '(no vinculado)'}\n"
+                    f"Resumen chat_id: {sm or '(no vinculado)'}\n"
+                    f"Estado: {activo}\n"
+                )
+            else:
+                # Opcional: indicar si es destino
+                found_as = ""
+                try:
+                    for origin_id, r in rc.items():
+                        if str(r.get("evidence_chat_id", "")).strip() == str(chat_id):
+                            found_as = f"EVIDENCIAS de ORIGEN {origin_id} ({r.get('alias') or '-'})"
+                            break
+                        if str(r.get("summary_chat_id", "")).strip() == str(chat_id):
+                            found_as = f"RESUMEN de ORIGEN {origin_id} ({r.get('alias') or '-'})"
+                            break
+                except Exception:
+                    found_as = ""
+                if found_as:
+                    txt = f"ℹ️ Este grupo no es ORIGEN.\nEstá vinculado como: {found_as}"
+                else:
+                    txt = "ℹ️ Este grupo no es ORIGEN y no aparece como destino en ROUTING."
+            await safe_q_answer(q, "Rutas", show_alert=False)
+            await safe_edit_message_text(q, txt, reply_markup=kb_back_to_config())
+            return
+
+        # CFG|PAIR|EVIDENCE o SUMMARY
+        if len(parts) >= 3 and parts[1] == "PAIR":
+            purpose = parts[2].strip().upper()
+            if purpose not in ("EVIDENCE", "SUMMARY"):
+                await safe_q_answer(q, "Opción inválida.", show_alert=True)
+                return
+
+            app = context.application
+            if not app.bot_data.get("sheets_ready"):
+                await safe_q_answer(q, "Sheets no disponible.", show_alert=True)
+                await safe_edit_message_text(q, "⚠️ Sheets no está disponible. Revisa credenciales / conexión.", reply_markup=kb_back_to_config())
+                return
+
+            # Heurística:
+            # - Si el chat actual está como ORIGEN (en ROUTING) o si el admin quiere iniciar desde ORIGEN,
+            #   generamos código aquí.
+            # - Si el chat NO es ORIGEN, pedimos pegar el código (consumir).
+            # Para hacerlo más intuitivo: si el admin está en un chat que NO es ORIGEN, asumimos DESTINO.
+
+            # Asegurar cache routing
+            if not app.bot_data.get("routing_cache"):
+                load_routing_cache(app)
+
+            rc = app.bot_data.get("routing_cache") or {}
+            is_origin = int(chat_id) in rc  # ya registrado como ORIGEN
+            # Si no está registrado, igual puede ser ORIGEN "nuevo"; pero tu operación dice cada técnico ya tiene ORIGEN.
+            # Para no bloquear, damos opción basada en botón: aquí usamos una lógica simple:
+            # - Si el grupo tiene título que parece SGI/ORIGEN o si no está en rc, le damos generar y consumir:
+            #   Pero como quieres flujo pro, hacemos:
+            #     1) Si NO es ORIGEN: consumir
+            #     2) Si es ORIGEN: generar
+            if is_origin:
+                try:
+                    code = pairing_create(app, origin_chat_id=int(chat_id), purpose=purpose, created_by=q.from_user.full_name)
+                    expires_dt = datetime.now(PERU_TZ) + timedelta(minutes=PAIRING_TTL_MINUTES)
+                    expires_txt = expires_dt.strftime("%H:%M")
+                    label = "EVIDENCIAS" if purpose == "EVIDENCE" else "RESUMEN"
+                    txt = (
+                        f"🔐 Código de vinculación ({label})\n\n"
+                        f"Código: {code}\n"
+                        f"Vence aprox.: {expires_txt} (Perú)\n\n"
+                        f"👉 Ve al grupo DESTINO ({label})\n"
+                        f"y usa /config → {'🔗 Vincular Evidencias' if purpose=='EVIDENCE' else '🧾 Vincular Resumen'}\n"
+                        f"para pegar el código."
+                    )
+                    await safe_q_answer(q, "Código generado", show_alert=False)
+                    await safe_edit_message_text(q, txt, reply_markup=kb_back_to_config())
+                except Exception as e:
+                    await safe_q_answer(q, "Error", show_alert=True)
+                    await safe_edit_message_text(q, f"⚠️ No pude generar el código: {e}", reply_markup=kb_back_to_config())
+                return
+            else:
+                # Consumir (DESTINO): pedimos código por texto
+                kind = "PAIR_CODE_EVID" if purpose == "EVIDENCE" else "PAIR_CODE_SUM"
+                set_pending_input(chat_id=chat_id, user_id=user_id, kind=kind, case_id=0, step_no=0, attempt=0, reply_to_message_id=q.message.message_id)
+                label = "EVIDENCIAS" if purpose == "EVIDENCE" else "RESUMEN"
+                txt = (
+                    f"🔗 Vincular {label}\n"
+                    f"✅ Pega aquí el código (ej: PAIR-ABC123)\n\n"
+                    f"Este grupo será el DESTINO de {label}."
+                )
+                await safe_q_answer(q, "Pega el código", show_alert=False)
+                await safe_edit_message_text(q, txt, reply_markup=kb_back_to_config())
+                return
+
+        await safe_q_answer(q, "Opción no válida.", show_alert=True)
+        return
+
+    # -------------------------
+    # FLUJO ORIGINAL (casos/evidencias)
+    # -------------------------
     if data == "BACK|MODE":
         case_row = get_open_case(chat_id, user_id)
         if not case_row:
@@ -1612,9 +2191,6 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "PERMISO":
-            # CAMBIO ACORDADO:
-            # - El botón SOLICITUD DE PERMISO ya NO pregunta "¿Quieres solicitar alguna autorización?"
-            # - Va DIRECTO al selector: Solo texto / Multimedia
             update_case(case_id, phase="AUTH_MODE", pending_step_no=step_no)
             await safe_q_answer(q, "Permiso…", show_alert=False)
             await context.bot.send_message(
@@ -1709,7 +2285,6 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         approval_required = get_approval_required(int(case_row["chat_id"]))
 
         if not approval_required:
-            # AUTO-APROBACIÓN (APROBACION OFF): no enviar mensaje de admins
             auto_approve_db_step(case_id, auth_step_no, attempt)
             enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", "APROBACION OFF", "", kind="PERM")
 
@@ -1720,7 +2295,6 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text=prompt_media_step(step_no))
             return
 
-        # Aprobación ON: flujo normal (admins validan)
         mark_submitted(case_id, auth_step_no, attempt)
         await safe_q_answer(q, "📨 Enviado a revisión", show_alert=False)
 
@@ -1862,7 +2436,6 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tech_id = int(case_row["user_id"])
 
         if not approval_required:
-            # AUTO-APROBACIÓN: no pedir admins
             auto_approve_db_step(case_id, step_no, attempt)
             enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", "APROBACION OFF", "", kind="EVID")
 
@@ -1888,7 +2461,8 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 enqueue_caso_row(case_id)
 
-                route = get_route_for_chat(int(case_row["chat_id"]))
+                # routing desde Sheets cache
+                route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
                 dest_summary = route.get("summary")
                 if dest_summary:
                     created_at = case_row["created_at"] or "-"
@@ -1924,7 +2498,6 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_evidence_menu(chat_id, context, case_row2)
             return
 
-        # Aprobación ON: flujo normal (admins validan)
         mark_submitted(case_id, step_no, attempt)
         await safe_q_answer(q, "📨 Enviado a revisión", show_alert=False)
 
@@ -2007,7 +2580,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 enqueue_caso_row(case_id)
 
-                route = get_route_for_chat(int(case_row["chat_id"]))
+                route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
                 dest_summary = route.get("summary")
                 if dest_summary:
                     created_at = case_row["created_at"] or "-"
@@ -2069,15 +2642,86 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_q_answer(q, "Acción no válida.", show_alert=True)
 
-
 # =========================
-# Text handler (PASO 3 + AUTH_TEXT + motivos)
+# Text handler (PASO 3 + AUTH_TEXT + motivos + Pairing codes)
 # =========================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg: Message = update.effective_message
     if msg is None or msg.from_user is None:
         return
 
+    # -------------------------
+    # Pairing: pegar código (admin-only)
+    # -------------------------
+    pending_pair_e = pop_pending_input(msg.chat_id, msg.from_user.id, "PAIR_CODE_EVID")
+    if pending_pair_e:
+        if not await is_admin_of_chat(context, msg.chat_id, msg.from_user.id):
+            await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Solo administradores pueden vincular.")
+            return
+        code = (msg.text or "").strip().upper()
+        if not re.match(r"^PAIR-[A-Z0-9]{6}$", code):
+            await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Código inválido. Ejemplo válido: PAIR-ABC123")
+            set_pending_input(msg.chat_id, msg.from_user.id, "PAIR_CODE_EVID", 0, 0, 0)
+            return
+        try:
+            info = pairing_consume_and_upsert_routing(
+                context.application,
+                code=code,
+                dest_chat_id=msg.chat_id,
+                used_by=msg.from_user.full_name,
+                purpose_expected="EVIDENCE",
+                dest_kind="EVIDENCE",
+            )
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=(
+                    "✅ Vinculación completada (EVIDENCIAS)\n"
+                    f"ORIGEN chat_id: {info.get('origin_chat_id')}\n"
+                    f"Alias: {info.get('alias')}\n"
+                    f"DESTINO (este grupo): {msg.chat_id}"
+                ),
+                reply_markup=kb_back_to_config(),
+            )
+        except Exception as e:
+            await context.bot.send_message(chat_id=msg.chat_id, text=f"⚠️ No pude vincular: {e}", reply_markup=kb_back_to_config())
+        return
+
+    pending_pair_s = pop_pending_input(msg.chat_id, msg.from_user.id, "PAIR_CODE_SUM")
+    if pending_pair_s:
+        if not await is_admin_of_chat(context, msg.chat_id, msg.from_user.id):
+            await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Solo administradores pueden vincular.")
+            return
+        code = (msg.text or "").strip().upper()
+        if not re.match(r"^PAIR-[A-Z0-9]{6}$", code):
+            await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ Código inválido. Ejemplo válido: PAIR-ABC123")
+            set_pending_input(msg.chat_id, msg.from_user.id, "PAIR_CODE_SUM", 0, 0, 0)
+            return
+        try:
+            info = pairing_consume_and_upsert_routing(
+                context.application,
+                code=code,
+                dest_chat_id=msg.chat_id,
+                used_by=msg.from_user.full_name,
+                purpose_expected="SUMMARY",
+                dest_kind="SUMMARY",
+            )
+            await context.bot.send_message(
+                chat_id=msg.chat_id,
+                text=(
+                    "✅ Vinculación completada (RESUMEN)\n"
+                    f"ORIGEN chat_id: {info.get('origin_chat_id')}\n"
+                    f"Alias: {info.get('alias')}\n"
+                    f"DESTINO (este grupo): {msg.chat_id}"
+                ),
+                reply_markup=kb_back_to_config(),
+            )
+        except Exception as e:
+            await context.bot.send_message(chat_id=msg.chat_id, text=f"⚠️ No pude vincular: {e}", reply_markup=kb_back_to_config())
+        return
+
+    # -------------------------
+    # Rechazos autorización/evidencia (admin)
+    # -------------------------
     pending_auth = pop_pending_input(msg.chat_id, msg.from_user.id, "AUTH_REJECT_REASON")
     if pending_auth:
         reason = (msg.text or "").strip()
@@ -2183,11 +2827,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=msg.chat_id, text="Elige una opción:", reply_markup=kb_action_menu(case_id, step_no))
         return
 
+    # -------------------------
+    # Flujo técnico normal
+    # -------------------------
     case_row = get_open_case(msg.chat_id, msg.from_user.id)
     if not case_row:
         return
 
-    # En fases de carga de archivos, no aceptamos texto.
     if (case_row["phase"] or "") in ("STEP_MEDIA", "AUTH_MEDIA"):
         await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ En este paso no se acepta texto. Envía el archivo según corresponda.")
         return
@@ -2207,13 +2853,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = ensure_step_state(case_id, auth_step_no)
         attempt = int(st["attempt"])
 
-        # guardar auth_text con step_no NEGATIVO (auth_step_no)
         save_auth_text(case_id, auth_step_no, attempt, text, msg.message_id)
 
         approval_required = get_approval_required(int(case_row["chat_id"]))
 
         if not approval_required:
-            # AUTO-APROBACIÓN: no enviar a admins, pasar directo a cargar foto
             auto_approve_db_step(case_id, auth_step_no, attempt)
             enqueue_detalle_paso_row(case_id, step_no, attempt, "APROBADO", "APROBACION OFF", "", kind="PERM")
 
@@ -2229,7 +2873,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=msg.chat_id, text=prompt_media_step(step_no))
             return
 
-        # Aprobación ON: flujo normal (admins validan)
         mark_submitted(case_id, auth_step_no, attempt)
         update_case(case_id, phase="AUTH_REVIEW", pending_step_no=step_no)
 
@@ -2260,7 +2903,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     update_case(int(case_row["case_id"]), abonado_code=text, step_index=3, phase="WAIT_LOCATION")
     await context.bot.send_message(chat_id=msg.chat_id, text=f"✅ Código de abonado registrado: {text}\n\n{prompt_step4()}")
-
 
 # =========================
 # PASO 4: Ubicación
@@ -2297,7 +2939,6 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_install_mode(),
     )
 
-
 # =========================
 # Carga de media
 #   - Evidencias normales: SOLO FOTO
@@ -2324,16 +2965,12 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_step_no < 5 or pending_step_no > 15:
         return
 
-    # BLOQUEO ACORDADO:
-    # - En evidencias normales (STEP_MEDIA): solo fotos
-    # - En permisos (AUTH_MEDIA): fotos o videos
     if phase == "STEP_MEDIA":
         if not msg.photo:
             await context.bot.send_message(chat_id=msg.chat_id, text="⚠️ En este paso solo se aceptan FOTOS.")
             return
         file_type = "photo"
     else:
-        # AUTH_MEDIA
         if msg.photo:
             file_type = "photo"
         elif msg.video:
@@ -2370,7 +3007,6 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=msg.chat_id, text="Controles:", reply_markup=controls_kb)
         return
 
-    # Extraer file_id
     if file_type == "photo":
         ph = msg.photo[-1]
         file_id = ph.file_id
@@ -2403,7 +3039,8 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         meta=meta,
     )
 
-    route = get_route_for_chat(msg.chat_id)
+    # Routing por Sheets cache
+    route = get_route_for_chat_cached(context.application, msg.chat_id)
     caption = (
         f"📌 {label} ({STEP_MEDIA_DEFS.get(pending_step_no, (f'PASO {pending_step_no}',))[0]})\n"
         f"Técnico: {case_row['technician_name'] or '-'}\n"
@@ -2414,7 +3051,6 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await maybe_copy_to_group(context, route.get("evidence"), file_type, file_id, caption)
 
-    # En cola solo para evidencias reales (no permisos)
     if phase != "AUTH_MEDIA" and file_type == "photo":
         enqueue_evidencia_row(case_row, pending_step_no, attempt, file_id, file_unique_id, msg.message_id, route.get("evidence"))
 
@@ -2434,13 +3070,11 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=controls_kb,
         )
 
-
 # =========================
 # Error handler
 # =========================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Error no manejado:", exc_info=context.error)
-
 
 # =========================
 # Main
@@ -2451,7 +3085,6 @@ def main():
 
     init_db()
 
-    # Timeouts más robustos (reduce “cuelgues” por red)
     request = HTTPXRequest(connect_timeout=10, read_timeout=25, write_timeout=25, pool_timeout=10)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
 
@@ -2462,6 +3095,7 @@ def main():
     app.add_handler(CommandHandler("cancelar", cancelar_cmd))
     app.add_handler(CommandHandler("estado", estado_cmd))
     app.add_handler(CommandHandler("aprobacion", aprobacion_cmd))
+    app.add_handler(CommandHandler("config", config_cmd))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(on_callbacks))
@@ -2473,9 +3107,11 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # Sheets init + indices + worker (reintentos)
+    # Sheets init + indices + worker (reintentos) + config tabs
     try:
         sh = sheets_client()
+
+        # Historial
         ws_casos = sh.worksheet("CASOS")
         ws_det = sh.worksheet("DETALLE_PASOS")
         ws_evid = sh.worksheet("EVIDENCIAS")
@@ -2488,8 +3124,19 @@ def main():
         idx_det = build_index(ws_det, ["case_id", "paso_numero", "attempt"])
         idx_evid = build_index(ws_evid, ["case_id", "paso_numero", "attempt", "mensaje_telegram_id"])
 
+        # Config pro
+        ws_tecnicos = sh.worksheet(TECNICOS_TAB)
+        ws_routing = sh.worksheet(ROUTING_TAB)
+        ws_pairing = sh.worksheet(PAIRING_TAB)
+
+        _ensure_headers(ws_tecnicos, TECNICOS_COLUMNS)
+        _ensure_headers(ws_routing, ROUTING_COLUMNS)
+        _ensure_headers(ws_pairing, PAIRING_COLUMNS)
+
         app.bot_data["sheets_ready"] = True
         app.bot_data["sh"] = sh
+
+        # Historial refs
         app.bot_data["ws_casos"] = ws_casos
         app.bot_data["ws_det"] = ws_det
         app.bot_data["ws_evid"] = ws_evid
@@ -2497,10 +3144,23 @@ def main():
         app.bot_data["idx_det"] = idx_det
         app.bot_data["idx_evid"] = idx_evid
 
-        if app.job_queue:
-            app.job_queue.run_repeating(sheets_worker, interval=20, first=5)
+        # Config refs
+        app.bot_data["ws_tecnicos"] = ws_tecnicos
+        app.bot_data["ws_routing"] = ws_routing
+        app.bot_data["ws_pairing"] = ws_pairing
 
-        log.info("Sheets: conectado y worker iniciado.")
+        # Pre-cargar caches
+        load_tecnicos_cache(app)
+        load_routing_cache(app)
+
+        # Jobs
+        if app.job_queue:
+            # Worker de outbox historial
+            app.job_queue.run_repeating(sheets_worker, interval=20, first=5)
+            # Refresh config (TECNICOS + ROUTING)
+            app.job_queue.run_repeating(refresh_config_jobs, interval=30, first=10)
+
+        log.info("Sheets: conectado. Worker iniciado. Config cache (TECNICOS/ROUTING) habilitado.")
     except Exception as e:
         app.bot_data["sheets_ready"] = False
         log.warning(f"Sheets deshabilitado: {e}")
@@ -2511,3 +3171,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
